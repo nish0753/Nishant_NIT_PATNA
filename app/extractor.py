@@ -36,6 +36,7 @@ class PageWiseItems(BaseModel):
 class ExtractionData(BaseModel):
     pagewise_line_items: List[PageWiseItems]
     total_item_count: int
+    reconciled_amount: float
 
 class ExtractionResponse(BaseModel):
     is_success: bool
@@ -215,6 +216,7 @@ def extract_bill_data(image_source: Union[str, bytes], mime_type: str = None) ->
                 total_amount += item.get("item_amount", 0.0)
         
         data_dict['total_item_count'] = total_count
+        data_dict['reconciled_amount'] = round(total_amount, 2)
 
         return ExtractionResponse(
             is_success=True,
