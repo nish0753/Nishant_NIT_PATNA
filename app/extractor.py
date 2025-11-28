@@ -99,8 +99,61 @@ def extract_bill_data(image_source, mime_type: str = None) -> dict:
         # Mime type remains image/jpeg effectively after processing
         mime_type = 'image/jpeg' 
 
-    # Use Gemini 1.5 Flash for better stability and JSON mode support
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Switching to gemini-flash-latest to avoid rate limits on experimental models
+    # --- PAGE-BY-PAGE PROCESSING LOGIC ---
+    import io
+    from pypdf import PdfReader, PdfWriter
+
+    # If it's a PDF, we split it page by page
+    if mime_type == 'application/pdf':
+        try:
+            pdf_reader = PdfReader(io.BytesIO(file_data))
+            num_pages = len(pdf_reader.pages)
+            print(f"Processing PDF with {num_pages} pages...")
+
+            all_pagewise_items = []
+            total_item_count = 0
+
+            for i, page in enumerate(pdf_reader.pages):
+                print(f"Processing Page {i+1}/{num_pages}...")
+                
+                # Extract single page as a new PDF
+                writer = PdfWriter()
+                writer.add_page(page)
+                page_bytes_io = io.BytesIO()
+                writer.write(page_bytes_io)
+                page_data = page_bytes_io.getvalue()
+
+                # Call Gemini for this single page
+                page_result = call_gemini_api(page_data, 'application/pdf')
+                
+                # Aggregate results
+                if page_result and "pagewise_line_items" in page_result:
+                    for p_item in page_result["pagewise_line_items"]:
+                        # Force correct page number
+                        p_item["page_no"] = str(i + 1)
+                        all_pagewise_items.append(p_item)
+                
+                if page_result and "total_item_count" in page_result:
+                    total_item_count += page_result["total_item_count"]
+
+            return {
+                "pagewise_line_items": all_pagewise_items,
+                "total_item_count": total_item_count
+            }
+
+        except Exception as e:
+            print(f"PDF Processing Error: {e}")
+            # Fallback to single-shot if PDF splitting fails (e.g. encrypted)
+            pass
+
+    # --- SINGLE SHOT LOGIC (Images or Fallback) ---
+    return call_gemini_api(file_data, mime_type)
+
+
+def call_gemini_api(file_data, mime_type):
+    """Helper function to call Gemini for a single file/page."""
+    model = genai.GenerativeModel('gemini-flash-latest')
     
     prompt = """
     You are an expert data extraction agent. Your task is to extract line item details from the provided bill/invoice (image or PDF).
@@ -151,17 +204,27 @@ def extract_bill_data(image_source, mime_type: str = None) -> dict:
         response_mime_type="application/json"
     )
 
-    try:
-        response = model.generate_content(
-            [
-                {'mime_type': mime_type, 'data': file_data},
-                prompt
-            ],
-            generation_config=generation_config
-        )
-    except Exception as e:
-        print(f"Gemini API Error: {e}")
-        raise ValueError(f"Gemini API failed: {e}")
+    import time
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                [
+                    {'mime_type': mime_type, 'data': file_data},
+                    prompt
+                ],
+                generation_config=generation_config
+            )
+            break # Success
+        except Exception as e:
+            if "429" in str(e) or "Quota exceeded" in str(e) or "ResourceExhausted" in str(e):
+                if attempt < max_retries - 1:
+                    print(f"Quota exceeded. Retrying in {2 ** (attempt + 1)} seconds...")
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+            print(f"Gemini API Error: {e}")
+            raise ValueError(f"Gemini API failed: {e}")
 
     # Clean up response text to ensure it's valid JSON
     try:
