@@ -1,37 +1,55 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from .extractor import extract_bill_data, ExtractionResponse
+from .extractor import extract_bill_data
+from .schemas import FinalResponse
 import os
 
 app = FastAPI()
 
-# Get the directory where main.py is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-# Mount static files
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 class BillRequest(BaseModel):
     document: str
 
-@app.post("/extract-bill-data", response_model=ExtractionResponse)
+@app.post("/extract-bill-data", response_model=FinalResponse)
 async def extract_bill(request: BillRequest):
-    response = extract_bill_data(request.document)
-    if not response.is_success:
-        return response
-    return response
+    result = extract_bill_data(request.document)
 
-@app.post("/extract-from-file", response_model=ExtractionResponse)
+    return {
+        "is_success": True,
+        "token_usage": {
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+        },
+        "data": {
+            "pagewise_line_items": result["pagewise_line_items"],
+            "total_item_count": result["total_item_count"]
+        }
+    }
+
+@app.post("/extract-from-file", response_model=FinalResponse)
 async def extract_from_file(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        response = extract_bill_data(contents, mime_type=file.content_type)
-        return response
-    except Exception as e:
-        return ExtractionResponse(is_success=False, error=str(e))
+    contents = await file.read()
+    result = extract_bill_data(contents, mime_type=file.content_type)
+
+    return {
+        "is_success": True,
+        "token_usage": {
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0
+        },
+        "data": {
+            "pagewise_line_items": result["pagewise_line_items"],
+            "total_item_count": result["total_item_count"]
+        }
+    }
 
 @app.get("/")
 async def read_index():
