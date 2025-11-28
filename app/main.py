@@ -13,27 +13,79 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
+
+@app.exception_handler(Exception)
+async def universal_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "is_success": False,
+            "token_usage": {
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+            },
+            "data": {
+                "pagewise_line_items": [],
+                "total_item_count": 0
+            },
+            "error": "Internal server error"
+        }
+    )
+
 class BillRequest(BaseModel):
     document: str
 
+def safe_float(value):
+    """Converts anything to float safely."""
+    try:
+        if value is None:
+            return 0.0
+        return float(str(value).replace(",", "").strip())
+    except:
+        return 0.0
+
 def build_response(result):
-    """Force-wrap extractor output into official response schema with safe casting."""
+    """Fully safe wrapper for hackathon API."""
+    
+    if not isinstance(result, dict):
+        result = {}
+
+    pages = result.get("pagewise_line_items", [])
+    if not isinstance(pages, list):
+        pages = []
 
     page_entries = []
-    for page in result["pagewise_line_items"]:
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+
+        items = page.get("bill_items", [])
+        if not isinstance(items, list):
+            items = []
+
+        safe_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            safe_items.append({
+                "item_name": item.get("item_name", "") or "",
+                "item_amount": safe_float(item.get("item_amount")),
+                "item_rate": safe_float(item.get("item_rate")),
+                "item_quantity": safe_float(item.get("item_quantity")),
+            })
+
         page_entries.append({
             "page_no": str(page.get("page_no", "1")),
             "page_type": page.get("page_type", "Bill Detail"),
-            "bill_items": [
-                {
-                    "item_name": item.get("item_name", ""),
-                    "item_amount": float(item.get("item_amount")) if item.get("item_amount") not in [None, "", "null"] else 0.0,
-                    "item_rate": float(item.get("item_rate")) if item.get("item_rate") not in [None, "", "null"] else 0.0,
-                    "item_quantity": float(item.get("item_quantity")) if item.get("item_quantity") not in [None, "", "null"] else 0.0
-                }
-                for item in page.get("bill_items", [])
-            ]
+            "bill_items": safe_items
         })
+
+    total_items = sum(len(p["bill_items"]) for p in page_entries)
 
     return {
         "is_success": True,
@@ -44,7 +96,7 @@ def build_response(result):
         },
         "data": {
             "pagewise_line_items": page_entries,
-            "total_item_count": result.get("total_item_count", sum(len(p["bill_items"]) for p in page_entries))
+            "total_item_count": total_items
         }
     }
 

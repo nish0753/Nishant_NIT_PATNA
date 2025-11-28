@@ -3,7 +3,7 @@ services:
     name: bill-extractor-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000 --timeout-keep-alive 120 --limit-max-requests 5000
     envVars:
       - key: GOOGLE_API_KEY
         sync: false
