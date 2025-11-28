@@ -17,28 +17,23 @@ class BillRequest(BaseModel):
     document: str
 
 def build_response(result):
-    """Force-wrap extractor output into official response schema."""
-    
+    """Force-wrap extractor output into official response schema with safe casting."""
+
     page_entries = []
     for page in result["pagewise_line_items"]:
         page_entries.append({
             "page_no": str(page.get("page_no", "1")),
-            "page_type": page.get("page_type", "Bill Detail"),  # safe default
+            "page_type": page.get("page_type", "Bill Detail"),
             "bill_items": [
                 {
-                    "item_name": item["item_name"],
-                    "item_amount": float(item["item_amount"]),
-                    "item_rate": float(item["item_rate"]),
-                    "item_quantity": float(item["item_quantity"]),
+                    "item_name": item.get("item_name", ""),
+                    "item_amount": float(item.get("item_amount")) if item.get("item_amount") not in [None, "", "null"] else 0.0,
+                    "item_rate": float(item.get("item_rate")) if item.get("item_rate") not in [None, "", "null"] else 0.0,
+                    "item_quantity": float(item.get("item_quantity")) if item.get("item_quantity") not in [None, "", "null"] else 0.0
                 }
-                for item in page["bill_items"]
+                for item in page.get("bill_items", [])
             ]
         })
-
-    total_amount = 0.0
-    for page in page_entries:
-        for item in page["bill_items"]:
-            total_amount += item["item_amount"]
 
     return {
         "is_success": True,
@@ -49,8 +44,7 @@ def build_response(result):
         },
         "data": {
             "pagewise_line_items": page_entries,
-            "total_item_count": result.get("total_item_count", len(page_entries)),
-            "total_amount": round(total_amount, 2)
+            "total_item_count": result.get("total_item_count", sum(len(p["bill_items"]) for p in page_entries))
         }
     }
 
