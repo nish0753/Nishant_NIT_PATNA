@@ -145,10 +145,18 @@ def extract_bill_data(image_source, mime_type: str = None) -> dict:
     }
     """
 
-    response = model.generate_content([
-        {'mime_type': mime_type, 'data': file_data},
-        prompt
-    ])
+    generation_config = genai.GenerationConfig(
+        max_output_tokens=8192,
+        response_mime_type="application/json"
+    )
+
+    response = model.generate_content(
+        [
+            {'mime_type': mime_type, 'data': file_data},
+            prompt
+        ],
+        generation_config=generation_config
+    )
     
     # Clean up response text to ensure it's valid JSON
     text = response.text.strip()
