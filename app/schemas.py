@@ -15,6 +15,7 @@ class PageLineItems(BaseModel):
 class DataBlock(BaseModel):
     pagewise_line_items: List[PageLineItems]
     total_item_count: int
+    total_amount: float
 
 class TokenUsage(BaseModel):
     total_tokens: int
