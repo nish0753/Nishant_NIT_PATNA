@@ -99,7 +99,8 @@ def extract_bill_data(image_source, mime_type: str = None) -> dict:
         # Mime type remains image/jpeg effectively after processing
         mime_type = 'image/jpeg' 
 
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    # Use Gemini 1.5 Flash for better stability and JSON mode support
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
     prompt = """
     You are an expert data extraction agent. Your task is to extract line item details from the provided bill/invoice (image or PDF).
@@ -150,16 +151,25 @@ def extract_bill_data(image_source, mime_type: str = None) -> dict:
         response_mime_type="application/json"
     )
 
-    response = model.generate_content(
-        [
-            {'mime_type': mime_type, 'data': file_data},
-            prompt
-        ],
-        generation_config=generation_config
-    )
-    
+    try:
+        response = model.generate_content(
+            [
+                {'mime_type': mime_type, 'data': file_data},
+                prompt
+            ],
+            generation_config=generation_config
+        )
+    except Exception as e:
+        print(f"Gemini API Error: {e}")
+        raise ValueError(f"Gemini API failed: {e}")
+
     # Clean up response text to ensure it's valid JSON
-    text = response.text.strip()
+    try:
+        text = response.text.strip()
+    except Exception as e:
+        print(f"Error reading response text (blocked?): {e}")
+        raise ValueError("Gemini response was blocked or empty.")
+
     print(f"DEBUG: Raw Gemini Response:\n{text}")
     
     text = clean_json(text)
