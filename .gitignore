@@ -2,3 +2,10 @@ __pycache__/
 .DS_Store
 .env
 result_*.json
+results/
+training_samples/
+*.pdf
+venv/
+.idea/
+.vscode/
+*.log
