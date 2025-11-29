@@ -1,10 +1,17 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from .extractor import extract_bill_data
 from .schemas import FinalResponse
 import os
+import logging
+import requests
+import asyncio
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -13,11 +20,11 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 @app.exception_handler(Exception)
 async def universal_exception_handler(request: Request, exc: Exception):
+    logger.error("Error while extracting: %s", exc)
     return JSONResponse(
         status_code=500,
         content={
@@ -100,18 +107,77 @@ def build_response(result):
         }
     }
 
+def download_file_sync(url: str):
+    """Synchronous download function to be run in executor."""
+    response = requests.get(url, timeout=20)
+    response.raise_for_status()
+    return response.content, response.headers.get('Content-Type', '')
 
 @app.post("/extract-bill-data", response_model=FinalResponse)
 async def extract_bill(request: BillRequest):
-    result = extract_bill_data(request.document)
-    return build_response(result)
+    try:
+        # Step 1: Download the document
+        logger.info("Downloding Start...")
+        logger.info(f"Received request for document: {request.document}")
+        
+        # Run synchronous download in a separate thread to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        pdf_bytes, content_type = await loop.run_in_executor(None, download_file_sync, request.document)
+        
+        logger.info(f"Download complete. Size: {len(pdf_bytes)} bytes. Type: {content_type}")
+
+        # Step 2: Process it
+        logger.info("Processing Start...")
+        # Pass bytes directly to extractor
+        result = await extract_bill_data(pdf_bytes, mime_type=content_type)
+
+        # Step 3: Wrap output into required format
+        logger.info("Processing complete. Building response.")
+        
+        # Check for empty items
+        if not result.get("pagewise_line_items") and result.get("total_item_count", 0) == 0:
+             logger.warning("No items detected")
+
+        return build_response(result)
+
+    except Exception as e:
+        logger.error("Error while extracting: %s", e)
+        # Return failure response as per diagram requirements
+        return {
+            "is_success": False,
+            "token_usage": {
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+            },
+            "data": {
+                "pagewise_line_items": [],
+                "total_item_count": 0
+            }
+        }
 
 
 @app.post("/extract-from-file", response_model=FinalResponse)
 async def extract_from_file(file: UploadFile = File(...)):
-    contents = await file.read()
-    result = extract_bill_data(contents, mime_type=file.content_type)
-    return build_response(result)
+    try:
+        logger.info(f"Received file upload: {file.filename}")
+        contents = await file.read()
+        result = await extract_bill_data(contents, mime_type=file.content_type)
+        return build_response(result)
+    except Exception as e:
+        logger.error(f"Error in extract_from_file: {e}")
+        return {
+            "is_success": False,
+            "token_usage": {
+                "total_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+            },
+            "data": {
+                "pagewise_line_items": [],
+                "total_item_count": 0
+            }
+        }
 
 
 @app.get("/")
