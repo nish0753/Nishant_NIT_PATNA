@@ -87,164 +87,77 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
     if not GENAI_API_KEY:
         raise Exception("GOOGLE_API_KEY not found in environment variables.")
 
+    # 1. Get Raw Data
     if isinstance(image_source, str):
-        # It's a URL - download synchronously (could be made async but fast enough usually)
-        # For true async, we'd use aiohttp, but keeping it simple for now as requests is fast for single files
         loop = asyncio.get_event_loop()
         file_data, mime_type = await loop.run_in_executor(None, download_image, image_source)
     else:
-        # It's raw bytes
         file_data = image_source
         if not mime_type:
             raise ValueError("Mime type must be provided for file uploads.")
 
-    # Apply preprocessing if it's an image
-    if mime_type and mime_type.startswith('image/'):
-        print("Applying image preprocessing...")
-        loop = asyncio.get_event_loop()
-        file_data = await loop.run_in_executor(None, preprocess_image, file_data)
-        # Mime type remains image/jpeg effectively after processing
-        mime_type = 'image/jpeg' 
-
-    # Switching to gemini-1.5-flash as requested
-    # --- PAGE-BY-PAGE PROCESSING LOGIC ---
+    # 2. Prepare Content Parts (List of images)
+    content_parts = []
+    
     import io
     import gc
-    import hashlib
+    from pdf2image import convert_from_bytes
 
-    # If it's a PDF, we convert to images using pdf2image
     if mime_type == 'application/pdf':
-        print("DEBUG: PDF detected. Converting to images using pdf2image.")
+        print("DEBUG: PDF detected. Converting to images for batch processing.")
         try:
-            # Run pdf2image in executor as it can be CPU intensive
             loop = asyncio.get_event_loop()
-            # 300 DPI is good for OCR
+            # Convert all pages to images
             images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=300))
-            num_pages = len(images)
+            print(f"DEBUG: PDF converted. Total pages: {len(images)}")
+
+            for i, image in enumerate(images):
+                with io.BytesIO() as output:
+                    image.save(output, format="JPEG", quality=95)
+                    img_bytes = output.getvalue()
+                    content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
+                # Close image to free memory
+                image.close()
             
-            print(f"DEBUG: PDF converted. Total pages: {num_pages}")
-
-            all_pagewise_items = []
-            total_item_count = 0
-            seen_page_hashes = set()
-            
-            # Semaphore to limit concurrency (Reduced to 1 for maximum stability on free tier)
-            sem = asyncio.Semaphore(1)
-
-            async def process_page(i, image):
-                async with sem:
-                    # Add jitter
-                    await asyncio.sleep(1) 
-                    
-                    print(f"DEBUG: Processing Page {i+1}/{num_pages}...")
-                    page_data = None
-                    try:
-                        # Convert PIL image to bytes
-                        with io.BytesIO() as output:
-                            image.save(output, format="JPEG", quality=95)
-                            page_data = output.getvalue()
-
-                        # Calculate hash to detect duplicates
-                        page_hash = hashlib.md5(page_data).hexdigest()
-                        
-                        if page_hash in seen_page_hashes:
-                            print(f"DEBUG: Page {i+1} is a duplicate. Skipping.")
-                            return None
-                        seen_page_hashes.add(page_hash)
-
-                        # Call Gemini for this single page (as image)
-                        print(f"DEBUG: Calling Gemini for Page {i+1}...")
-                        # Note: We send 'image/jpeg' because we converted it
-                        page_result = await call_gemini_api_async(page_data, 'image/jpeg')
-                        print(f"DEBUG: Gemini returned for Page {i+1}.")
-                        
-                        if page_result:
-                            # Tag with page number
-                            if "pagewise_line_items" in page_result:
-                                for p_item in page_result["pagewise_line_items"]:
-                                    p_item["page_no"] = str(i + 1)
-                            return page_result
-                        return None
-
-                    except Exception as e:
-                        print(f"ERROR processing page {i+1}: {e}")
-                        return None
-                    finally:
-                        if page_data:
-                            del page_data
-                        # Explicitly close the image to free memory
-                        if image:
-                            image.close()
-
-            # Create tasks for all pages
-            tasks = [process_page(i, img) for i, img in enumerate(images)]
-            results = await asyncio.gather(*tasks)
-
-            # Aggregate results
-            for res in results:
-                if res:
-                    if "pagewise_line_items" in res:
-                        all_pagewise_items.extend(res["pagewise_line_items"])
-                    if "total_item_count" in res:
-                        total_item_count += res["total_item_count"]
-            
-            # Explicit GC after batch
+            # Explicit GC
             gc.collect()
 
-            print("DEBUG: PDF processing complete. Returning aggregated results.")
-            # Sort by page number to maintain order
-            all_pagewise_items.sort(key=lambda x: int(x.get("page_no", "0")))
-
-            return {
-                "pagewise_line_items": all_pagewise_items,
-                "total_item_count": total_item_count
-            }
-
         except Exception as e:
-            print(f"ERROR: PDF Processing Failed: {e}")
-            import traceback
-            traceback.print_exc()
-            # Fallback to single-shot if PDF splitting fails
-            pass
+            print(f"ERROR: PDF Conversion Failed: {e}")
+            raise
+    
+    elif mime_type.startswith('image/'):
+        print("Applying image preprocessing...")
+        loop = asyncio.get_event_loop()
+        processed_data = await loop.run_in_executor(None, preprocess_image, file_data)
+        content_parts.append({'mime_type': 'image/jpeg', 'data': processed_data})
+    
+    else:
+        # Fallback for other types (shouldn't happen based on download_image)
+        content_parts.append({'mime_type': mime_type, 'data': file_data})
 
-    # --- SINGLE SHOT LOGIC (Images or Fallback) ---
-    return await call_gemini_api_async(file_data, mime_type)
+    # 3. Call Gemini (One Call for All Pages)
+    print(f"DEBUG: Sending {len(content_parts)} page(s) to Gemini in a single request...")
+    return await call_gemini_api_async(content_parts)
 
 
-async def call_gemini_api_async(file_data, mime_type):
-    """Helper function to call Gemini for a single file/page async."""
-    # Updated to gemini-2.0-flash-exp
-    model = genai.GenerativeModel('gemini-2.0-flash-exp')
+async def call_gemini_api_async(content_parts):
+    """Helper function to call Gemini with a list of content parts."""
+    # Updated to gemini-2.0-flash (Stable)
+    model = genai.GenerativeModel('gemini-2.0-flash')
     
     prompt = """
-    You are an expert data extraction agent. Your task is to extract line item details from the provided bill/invoice (image or PDF).
+    You are an expert data extraction agent. Your task is to extract line item details from the provided bill/invoice images.
+    The input consists of one or more pages of a SINGLE document.
 
-    GOAL: Extract all purchasable items such that the sum of their 'item_amount' equals the Final Bill Total.
+    GOAL: Extract all purchasable items from ALL pages such that the sum of their 'item_amount' equals the Final Bill Total.
 
-    CRITICAL INSTRUCTIONS (Read Carefully):
-    1. **Distinguish Amounts vs. Identifiers**: 
-       - Do NOT confuse "Invoice Number", "Date", "Time", or "ID codes" with monetary amounts. 
-       - Look for currency symbols ($, ₹, etc.) or columns labeled "Amount", "Total", "Price" to confirm values.
-    2. **No Subtotals**: Do NOT extract 'Sub-total', 'Total', 'Tax', or 'Discount' lines as items. Only extract the individual products/services that make up the bill.
-    3. **Charges are Items**: DO extract distinct charges like 'Pharmacy Charge', 'Consultation Fee', 'Shipping' if they are line items adding to the total.
-    4. **Exact Values**: Extract 'item_amount' exactly as shown (post-discount if applicable to the line).
-
-    FIELDS TO EXTRACT per item:
-    - item_name: Name/Description (String). Preserve newlines if present.
-    - item_amount: Net Amount (Float). The final value of this line item contributing to the bill total.
-    - item_rate: Unit Price (Float).
-    - item_quantity: Quantity (Float). Default to 1.0 if not specified but implied.
-
-    PAGE CLASSIFICATION:
-    - "Bill Detail": Contains detailed line items.
-    - "Final Bill": Summary page with totals (if separate).
-    - "Pharmacy": Specific to pharmacy bills.
-    If unsure, default to "Bill Detail".
-
-    Also calculate:
-    - total_item_count: Total number of line items extracted across all pages.
-
-    If the bill has multiple pages, treat this file as one document. If page numbers are visible, use them, otherwise default to "1".
+    CRITICAL INSTRUCTIONS:
+    1. **Distinguish Amounts vs. Identifiers**: Do NOT confuse IDs/Dates with monetary amounts.
+    2. **No Subtotals**: Do NOT extract 'Sub-total', 'Total', 'Tax', or 'Discount' lines as items.
+    3. **Charges are Items**: DO extract distinct charges like 'Pharmacy Charge', 'Shipping'.
+    4. **Exact Values**: Extract 'item_amount' exactly as shown.
+    5. **Page Mapping**: The input images correspond to pages 1, 2, 3... in order. Assign items to the correct 'page_no'.
 
     Output strictly in JSON format matching this structure:
     {
@@ -263,7 +176,38 @@ async def call_gemini_api_async(file_data, mime_type):
 
     generation_config = genai.GenerationConfig(
         max_output_tokens=8192,
-        response_mime_type="application/json"
+        response_mime_type="application/json",
+        response_schema={
+            "type": "object",
+            "properties": {
+                "pagewise_line_items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "page_no": {"type": "string"},
+                            "page_type": {"type": "string"},
+                            "bill_items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "item_name": {"type": "string"},
+                                        "item_amount": {"type": "number"},
+                                        "item_rate": {"type": "number"},
+                                        "item_quantity": {"type": "number"}
+                                    },
+                                    "required": ["item_name", "item_amount", "item_rate", "item_quantity"]
+                                }
+                            }
+                        },
+                        "required": ["page_no", "page_type", "bill_items"]
+                    }
+                },
+                "total_item_count": {"type": "integer"}
+            },
+            "required": ["pagewise_line_items", "total_item_count"]
+        }
     )
 
     safety_settings = {
@@ -276,74 +220,49 @@ async def call_gemini_api_async(file_data, mime_type):
     max_retries = 10
     for attempt in range(max_retries):
         try:
-            # Use async generate_content
+            # Construct the full prompt content: [img1, img2, ..., text_prompt]
+            full_content = content_parts + [prompt]
+            
             response = await model.generate_content_async(
-                [
-                    {'mime_type': mime_type, 'data': file_data},
-                    prompt
-                ],
+                full_content,
                 generation_config=generation_config,
                 safety_settings=safety_settings
             )
             
-            # Clean up response text to ensure it's valid JSON
             try:
                 text = response.text.strip()
             except Exception as e:
                 print(f"Error reading response text: {e}")
-                # Try to get text from candidates manually
-                try:
-                    text = response.candidates[0].content.parts[0].text
-                except:
-                    if attempt < max_retries - 1:
-                        print("Retrying due to empty/blocked response...")
-                        await asyncio.sleep(2)
-                        continue
-                    print("ERROR: Could not extract text from Gemini response. Skipping this page.")
-                    return {"pagewise_line_items": [], "total_item_count": 0}
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                return {"pagewise_line_items": [], "total_item_count": 0}
 
-            # print(f"DEBUG: Raw Gemini Response (Attempt {attempt+1}):\n{text[:100]}...") 
-            
             text = clean_json(text)
                 
             try:
                 data_dict = json.loads(text)
                 
-                # Recalculate total_item_count to be sure
+                # Recalculate total_item_count
                 total_count = 0
                 for page in data_dict.get("pagewise_line_items", []):
                     for item in page.get("bill_items", []):
                         total_count += 1
-                
                 data_dict['total_item_count'] = total_count
                 
-                return data_dict # Success!
-                
+                return data_dict
+
             except json.JSONDecodeError as e:
-                print(f"JSON Parse Error on attempt {attempt+1}: {e}")
-                # Try fallback repair
-                text_fixed = re.sub(r'"\s*\n\s*"', '",\n"', text)
-                try:
-                    data_dict = json.loads(text_fixed)
-                    # Recalculate total_item_count
-                    total_count = 0
-                    for page in data_dict.get("pagewise_line_items", []):
-                        for item in page.get("bill_items", []):
-                            total_count += 1
-                    data_dict['total_item_count'] = total_count
-                    return data_dict
-                except:
-                    if attempt < max_retries - 1:
-                        print(f"Retrying due to bad JSON...")
-                        await asyncio.sleep(2)
-                        continue
-                    raise ValueError(f"Failed to parse JSON after {max_retries} attempts: {e}")
+                print(f"JSON Parse Error: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)
+                    continue
+                raise
 
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "Quota exceeded" in error_str or "ResourceExhausted" in error_str:
                 if attempt < max_retries - 1:
-                    # Exponential backoff: 5, 10, 20, 40, 80...
                     wait_time = 5 * (2 ** attempt)
                     print(f"Quota exceeded (Attempt {attempt+1}/{max_retries}). Retrying in {wait_time} seconds...")
                     await asyncio.sleep(wait_time)

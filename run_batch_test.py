@@ -3,7 +3,7 @@ import os
 import json
 import time
 
-API_URL = "http://127.0.0.1:8001/extract-from-file"
+API_URL = "http://127.0.0.1:8000/extract-from-file"
 SAMPLES_DIR = "training_samples/TRAINING_SAMPLES"
 RESULTS_DIR = "results"
 
