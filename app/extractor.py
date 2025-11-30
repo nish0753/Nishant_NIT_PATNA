@@ -118,41 +118,75 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=200))
             print(f"DEBUG: PDF converted. Total pages: {len(images)}")
 
-            for i, image in enumerate(images):
-                # OCR Step (Hybrid Pipeline)
-                if pytesseract:
-                    try:
-                        # Debug Tesseract Path
-                        # print(f"DEBUG: Tesseract cmd: {pytesseract.pytesseract.tesseract_cmd}")
-                        
-                        # Run OCR in executor to avoid blocking
-                        text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
-                        ocr_context += f"\n--- Page {i+1} Raw OCR Text ---\n{text}\n"
-                    except Exception as e:
-                        print(f"OCR Warning on page {i+1}: {e}")
-                        # If tesseract is not found, try setting default path for Linux/Docker
-                        if "not installed" in str(e) or "not in your PATH" in str(e):
-                             print("DEBUG: Attempting to set default Tesseract path for Docker...")
-                             pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
-                             try:
-                                 text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
-                                 ocr_context += f"\n--- Page {i+1} Raw OCR Text ---\n{text}\n"
-                                 print("DEBUG: OCR succeeded with explicit path.")
-                             except Exception as e2:
-                                 print(f"OCR Retry Failed: {e2}")
-
-                with io.BytesIO() as output:
-                    image.save(output, format="JPEG", quality=95)
-                    img_bytes = output.getvalue()
-                    content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
-                # Close image to free memory
-                image.close()
+            # Smart Batching: Process pages in chunks to avoid Output Token Limit (8192)
+            # 10 pages * 30 items = ~300 items -> ~12k tokens (Too big)
+            # Batch size of 4 pages is safe (~120 items -> ~5k tokens)
+            BATCH_SIZE = 4
             
+            all_pagewise_items = []
+            total_item_count = 0
+            
+            # Split images into batches
+            for i in range(0, len(images), BATCH_SIZE):
+                batch_images = images[i : i + BATCH_SIZE]
+                print(f"DEBUG: Processing Batch {i//BATCH_SIZE + 1} (Pages {i+1} to {min(i+BATCH_SIZE, len(images))})...")
+                
+                batch_content_parts = []
+                batch_ocr_context = ""
+                
+                for j, image in enumerate(batch_images):
+                    page_num = i + j + 1
+                    
+                    # OCR Step
+                    if pytesseract:
+                        try:
+                            # Debug Tesseract Path
+                            # print(f"DEBUG: Tesseract cmd: {pytesseract.pytesseract.tesseract_cmd}")
+                            
+                            text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
+                            batch_ocr_context += f"\n--- Page {page_num} Raw OCR Text ---\n{text}\n"
+                        except Exception as e:
+                            print(f"OCR Warning on page {page_num}: {e}")
+                            if "not installed" in str(e) or "not in your PATH" in str(e):
+                                 print("DEBUG: Attempting to set default Tesseract path for Docker...")
+                                 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+                                 try:
+                                     text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
+                                     batch_ocr_context += f"\n--- Page {page_num} Raw OCR Text ---\n{text}\n"
+                                     print("DEBUG: OCR succeeded with explicit path.")
+                                 except Exception as e2:
+                                     print(f"OCR Retry Failed: {e2}")
+
+                    with io.BytesIO() as output:
+                        image.save(output, format="JPEG", quality=95)
+                        img_bytes = output.getvalue()
+                        batch_content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
+                    image.close()
+
+                # Call Gemini for this batch
+                print(f"DEBUG: Sending batch of {len(batch_content_parts)} page(s) to Gemini...")
+                batch_result = await call_gemini_api_async(batch_content_parts, batch_ocr_context)
+                
+                # Aggregate results
+                if batch_result:
+                    if "pagewise_line_items" in batch_result:
+                        all_pagewise_items.extend(batch_result["pagewise_line_items"])
+                    if "total_item_count" in batch_result:
+                        total_item_count += batch_result["total_item_count"]
+                
+                # Small delay to be nice to the API
+                await asyncio.sleep(1)
+
             # Explicit GC
             gc.collect()
+            
+            return {
+                "pagewise_line_items": all_pagewise_items,
+                "total_item_count": total_item_count
+            }
 
         except Exception as e:
-            print(f"ERROR: PDF Conversion Failed: {e}")
+            print(f"ERROR: PDF Processing Failed: {e}")
             raise
     
     elif mime_type.startswith('image/'):
@@ -171,17 +205,14 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                 print(f"OCR Warning: {e}")
 
         content_parts.append({'mime_type': 'image/jpeg', 'data': processed_data})
+        
+        # Single image call
+        return await call_gemini_api_async(content_parts, ocr_context)
     
     else:
-        # Fallback for other types (shouldn't happen based on download_image)
+        # Fallback
         content_parts.append({'mime_type': mime_type, 'data': file_data})
-
-    # 3. Call Gemini (One Call for All Pages + OCR Context)
-    print(f"DEBUG: Sending {len(content_parts)} page(s) to Gemini in a single request...")
-    if ocr_context:
-        print("DEBUG: Including OCR context in prompt.")
-    
-    return await call_gemini_api_async(content_parts, ocr_context)
+        return await call_gemini_api_async(content_parts, ocr_context)
 
 
 async def call_gemini_api_async(content_parts, ocr_context=""):
@@ -296,12 +327,31 @@ async def call_gemini_api_async(content_parts, ocr_context=""):
                 for page in data_dict.get("pagewise_line_items", []):
                     for item in page.get("bill_items", []):
                         total_count += 1
+                
                 data_dict['total_item_count'] = total_count
                 
                 return data_dict
 
             except json.JSONDecodeError as e:
                 print(f"JSON Parse Error: {e}")
+                # Try robust repair
+                try:
+                    import json_repair
+                    print("DEBUG: Attempting to repair JSON with json_repair...")
+                    data_dict = json_repair.loads(text)
+                    
+                    # Validate structure after repair
+                    if isinstance(data_dict, dict) and "pagewise_line_items" in data_dict:
+                        total_count = 0
+                        for page in data_dict.get("pagewise_line_items", []):
+                            for item in page.get("bill_items", []):
+                                total_count += 1
+                        data_dict['total_item_count'] = total_count
+                        print("DEBUG: JSON repair successful.")
+                        return data_dict
+                except Exception as repair_e:
+                    print(f"JSON Repair Failed: {repair_e}")
+
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue

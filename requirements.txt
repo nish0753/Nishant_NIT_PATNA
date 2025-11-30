@@ -5,6 +5,7 @@ google-generativeai
 pydantic
 python-dotenv
 pytesseract
+json_repair
 python-multipart
 Pillow
 pypdf
