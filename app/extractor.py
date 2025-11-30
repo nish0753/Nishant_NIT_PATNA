@@ -151,17 +151,17 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             print(f"DEBUG: PDF converted. Total pages: {len(images)}")
 
             # Smart Batching: Process pages in chunks to avoid Output Token Limit (8192)
-            # 10 pages * 30 items = ~300 items -> ~12k tokens (Too big)
-            # Batch size of 4 pages is safe (~120 items -> ~5k tokens)
-            BATCH_SIZE = 4
+            # Reduced Batch Size to 2 for better accuracy (less context crowding)
+            BATCH_SIZE = 2
             
             all_pagewise_items = []
             total_item_count = 0
             
-            # Split images into batches
+            # Prepare tasks for parallel execution
+            batch_tasks = []
+            
             for i in range(0, len(images), BATCH_SIZE):
                 batch_images = images[i : i + BATCH_SIZE]
-                print(f"DEBUG: Processing Batch {i//BATCH_SIZE + 1} (Pages {i+1} to {min(i+BATCH_SIZE, len(images))})...")
                 
                 batch_content_parts = []
                 batch_ocr_context = ""
@@ -169,10 +169,11 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                 for j, image in enumerate(batch_images):
                     page_num = i + j + 1
                     
-                    # OCR Step
+                    # OCR Step (Pre-compute OCR for all batches sequentially or parallel? 
+                    # Let's keep OCR inside the loop but run it efficiently)
                     if pytesseract:
                         try:
-                            # Run OCR in executor to avoid blocking
+                            # Run OCR in executor
                             text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
                             batch_ocr_context += f"\n--- Page {page_num} Raw OCR Text ---\n{text}\n"
                         except Exception as e:
@@ -184,22 +185,28 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                         batch_content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
                     image.close()
 
-                # Call Gemini for this batch
-                print(f"DEBUG: Sending batch of {len(batch_content_parts)} page(s) to Gemini...")
-                batch_result = await call_gemini_api_async(batch_content_parts, batch_ocr_context)
-                
-                # Aggregate results
+                # Create async task for this batch
+                print(f"DEBUG: Queueing Batch {i//BATCH_SIZE + 1} (Pages {i+1} to {min(i+BATCH_SIZE, len(images))})...")
+                task = call_gemini_api_async(batch_content_parts, batch_ocr_context)
+                batch_tasks.append(task)
+
+            # Execute all batches in parallel
+            print(f"DEBUG: Executing {len(batch_tasks)} batches in parallel...")
+            batch_results = await asyncio.gather(*batch_tasks)
+            
+            # Aggregate results
+            for batch_result in batch_results:
                 if batch_result:
                     if "pagewise_line_items" in batch_result:
                         all_pagewise_items.extend(batch_result["pagewise_line_items"])
                     if "total_item_count" in batch_result:
                         total_item_count += batch_result["total_item_count"]
-                
-                # Small delay to be nice to the API
-                await asyncio.sleep(1)
 
             # Explicit GC
             gc.collect()
+            
+            # Sort items by page number just in case they came back out of order (though extend preserves order of tasks)
+            # But page_no is a string, so we might want to rely on the list order which matches batch order.
             
             return {
                 "pagewise_line_items": all_pagewise_items,
