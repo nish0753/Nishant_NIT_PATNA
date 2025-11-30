@@ -96,7 +96,15 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
         if not mime_type:
             raise ValueError("Mime type must be provided for file uploads.")
 
-    # 2. Prepare Content Parts (List of images) and OCR Context
+    # 2. Magic Byte Detection (Fix for application/octet-stream)
+    # Azure/AWS sometimes return 'application/octet-stream' for PDFs.
+    # We sniff the first 4 bytes to see if it's actually a PDF.
+    if file_data and len(file_data) > 4:
+        if file_data[:4] == b'%PDF':
+            print(f"DEBUG: Detected PDF magic bytes. Overriding mime_type '{mime_type}' to 'application/pdf'")
+            mime_type = 'application/pdf'
+
+    # 3. Prepare Content Parts (List of images) and OCR Context
     content_parts = []
     ocr_context = ""
     
