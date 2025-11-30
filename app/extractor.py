@@ -114,18 +114,32 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
         try:
             loop = asyncio.get_event_loop()
             # Convert all pages to images
-            images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=300))
+            # Reduced DPI to 200 to prevent OOM on Render (Free Tier 512MB RAM)
+            images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=200))
             print(f"DEBUG: PDF converted. Total pages: {len(images)}")
 
             for i, image in enumerate(images):
                 # OCR Step (Hybrid Pipeline)
                 if pytesseract:
                     try:
+                        # Debug Tesseract Path
+                        # print(f"DEBUG: Tesseract cmd: {pytesseract.pytesseract.tesseract_cmd}")
+                        
                         # Run OCR in executor to avoid blocking
                         text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
                         ocr_context += f"\n--- Page {i+1} Raw OCR Text ---\n{text}\n"
                     except Exception as e:
                         print(f"OCR Warning on page {i+1}: {e}")
+                        # If tesseract is not found, try setting default path for Linux/Docker
+                        if "not installed" in str(e) or "not in your PATH" in str(e):
+                             print("DEBUG: Attempting to set default Tesseract path for Docker...")
+                             pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+                             try:
+                                 text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
+                                 ocr_context += f"\n--- Page {i+1} Raw OCR Text ---\n{text}\n"
+                                 print("DEBUG: OCR succeeded with explicit path.")
+                             except Exception as e2:
+                                 print(f"OCR Retry Failed: {e2}")
 
                 with io.BytesIO() as output:
                     image.save(output, format="JPEG", quality=95)
