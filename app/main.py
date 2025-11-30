@@ -138,9 +138,13 @@ async def extract_bill(request: BillRequest):
         if not result.get("pagewise_line_items") and result.get("total_item_count", 0) == 0:
              logger.warning("No items detected")
 
-        return build_response(result)
+        response = build_response(result)
+        item_count = response["data"]["total_item_count"]
+        logger.info(f"SUCCESS: Extracted {item_count} items from document: {request.document}")
+        return response
 
     except Exception as e:
+        logger.error(f"FAILURE: Failed to extract from document: {request.document}. Error: {e}")
         logger.error("Error while extracting: %s", e)
         # Return failure response as per diagram requirements
         return {
@@ -163,8 +167,12 @@ async def extract_from_file(file: UploadFile = File(...)):
         logger.info(f"Received file upload: {file.filename}")
         contents = await file.read()
         result = await extract_bill_data(contents, mime_type=file.content_type)
-        return build_response(result)
+        response = build_response(result)
+        item_count = response["data"]["total_item_count"]
+        logger.info(f"SUCCESS: Extracted {item_count} items from file: {file.filename}")
+        return response
     except Exception as e:
+        logger.error(f"FAILURE: Failed to extract from file: {file.filename}. Error: {e}")
         logger.error(f"Error in extract_from_file: {e}")
         return {
             "is_success": False,
