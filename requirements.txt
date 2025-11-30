@@ -4,6 +4,7 @@ requests
 google-generativeai
 pydantic
 python-dotenv
+pytesseract
 python-multipart
 Pillow
 pypdf

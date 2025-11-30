@@ -1,9 +1,9 @@
 FROM python:3.10-slim
 
-# Install system dependencies
-# poppler-utils is required for pdf2image
 RUN apt-get update && apt-get install -y \
     poppler-utils \
+    tesseract-ocr \
+    libtesseract-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

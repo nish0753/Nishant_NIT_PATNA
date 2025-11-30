@@ -96,12 +96,18 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
         if not mime_type:
             raise ValueError("Mime type must be provided for file uploads.")
 
-    # 2. Prepare Content Parts (List of images)
+    # 2. Prepare Content Parts (List of images) and OCR Context
     content_parts = []
+    ocr_context = ""
     
     import io
     import gc
     from pdf2image import convert_from_bytes
+    try:
+        import pytesseract
+    except ImportError:
+        pytesseract = None
+        print("WARNING: pytesseract not found. OCR step will be skipped.")
 
     if mime_type == 'application/pdf':
         print("DEBUG: PDF detected. Converting to images for batch processing.")
@@ -112,6 +118,15 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             print(f"DEBUG: PDF converted. Total pages: {len(images)}")
 
             for i, image in enumerate(images):
+                # OCR Step (Hybrid Pipeline)
+                if pytesseract:
+                    try:
+                        # Run OCR in executor to avoid blocking
+                        text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
+                        ocr_context += f"\n--- Page {i+1} Raw OCR Text ---\n{text}\n"
+                    except Exception as e:
+                        print(f"OCR Warning on page {i+1}: {e}")
+
                 with io.BytesIO() as output:
                     image.save(output, format="JPEG", quality=95)
                     img_bytes = output.getvalue()
@@ -130,23 +145,37 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
         print("Applying image preprocessing...")
         loop = asyncio.get_event_loop()
         processed_data = await loop.run_in_executor(None, preprocess_image, file_data)
+        
+        # OCR for single image
+        if pytesseract:
+            try:
+                import PIL.Image
+                img_obj = PIL.Image.open(io.BytesIO(processed_data))
+                text = await loop.run_in_executor(None, pytesseract.image_to_string, img_obj)
+                ocr_context += f"\n--- Raw OCR Text ---\n{text}\n"
+            except Exception as e:
+                print(f"OCR Warning: {e}")
+
         content_parts.append({'mime_type': 'image/jpeg', 'data': processed_data})
     
     else:
         # Fallback for other types (shouldn't happen based on download_image)
         content_parts.append({'mime_type': mime_type, 'data': file_data})
 
-    # 3. Call Gemini (One Call for All Pages)
+    # 3. Call Gemini (One Call for All Pages + OCR Context)
     print(f"DEBUG: Sending {len(content_parts)} page(s) to Gemini in a single request...")
-    return await call_gemini_api_async(content_parts)
+    if ocr_context:
+        print("DEBUG: Including OCR context in prompt.")
+    
+    return await call_gemini_api_async(content_parts, ocr_context)
 
 
-async def call_gemini_api_async(content_parts):
-    """Helper function to call Gemini with a list of content parts."""
+async def call_gemini_api_async(content_parts, ocr_context=""):
+    """Helper function to call Gemini with a list of content parts and optional OCR context."""
     # Updated to gemini-2.0-flash (Stable)
     model = genai.GenerativeModel('gemini-2.0-flash')
     
-    prompt = """
+    base_prompt = """
     You are an expert data extraction agent. Your task is to extract line item details from the provided bill/invoice images.
     The input consists of one or more pages of a SINGLE document.
 
@@ -158,6 +187,7 @@ async def call_gemini_api_async(content_parts):
     3. **Charges are Items**: DO extract distinct charges like 'Pharmacy Charge', 'Shipping'.
     4. **Exact Values**: Extract 'item_amount' exactly as shown.
     5. **Page Mapping**: The input images correspond to pages 1, 2, 3... in order. Assign items to the correct 'page_no'.
+    6. **Use OCR Context**: Raw OCR text is provided below to help you decipher blurry text or ambiguous numbers. Use it to validate your visual understanding.
 
     Output strictly in JSON format matching this structure:
     {
@@ -173,6 +203,11 @@ async def call_gemini_api_async(content_parts):
       "total_item_count": 0
     }
     """
+    
+    if ocr_context:
+        prompt = base_prompt + f"\n\n=== RAW OCR TEXT CONTEXT ===\n{ocr_context}"
+    else:
+        prompt = base_prompt
 
     generation_config = genai.GenerationConfig(
         max_output_tokens=8192,
@@ -232,7 +267,6 @@ async def call_gemini_api_async(content_parts):
             try:
                 text = response.text.strip()
             except Exception as e:
-                print(f"Error reading response text: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
