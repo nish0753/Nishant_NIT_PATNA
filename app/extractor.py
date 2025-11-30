@@ -151,8 +151,8 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             print(f"DEBUG: PDF converted. Total pages: {len(images)}")
 
             # Smart Batching: Process pages in chunks to avoid Output Token Limit (8192)
-            # Reduced Batch Size to 2 for better accuracy (less context crowding)
-            BATCH_SIZE = 2
+            # Reduced Batch Size to 1 for ULTIMATE ACCURACY (Context Isolation)
+            BATCH_SIZE = 1
             
             all_pagewise_items = []
             total_item_count = 0
@@ -187,7 +187,16 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
 
                 # Create async task for this batch
                 print(f"DEBUG: Queueing Batch {i//BATCH_SIZE + 1} (Pages {i+1} to {min(i+BATCH_SIZE, len(images))})...")
-                task = call_gemini_api_async(batch_content_parts, batch_ocr_context)
+                
+                # Use a Semaphore to limit concurrency to 2 (Safe for Gemini Flash Quota)
+                # This prevents "429 Too Many Requests" which would actually SLOW us down due to retries.
+                sem = asyncio.Semaphore(2)
+                
+                async def sem_task(content, ocr):
+                    async with sem:
+                        return await call_gemini_api_async(content, ocr)
+
+                task = sem_task(batch_content_parts, batch_ocr_context)
                 batch_tasks.append(task)
 
             # Execute all batches in parallel
