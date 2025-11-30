@@ -102,12 +102,28 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
     
     import io
     import gc
+    import shutil
     from pdf2image import convert_from_bytes
     try:
         import pytesseract
     except ImportError:
         pytesseract = None
         print("WARNING: pytesseract not found. OCR step will be skipped.")
+
+    # Robust Tesseract Path Detection
+    if pytesseract:
+        tesseract_path = shutil.which("tesseract")
+        if tesseract_path:
+            print(f"DEBUG: Tesseract found at: {tesseract_path}")
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        else:
+            # Try common Docker/Linux path if not found in PATH
+            if os.path.exists("/usr/bin/tesseract"):
+                 print("DEBUG: Tesseract found at /usr/bin/tesseract")
+                 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+            else:
+                 print("WARNING: Tesseract binary not found in PATH. OCR will be skipped.")
+                 pytesseract = None
 
     if mime_type == 'application/pdf':
         print("DEBUG: PDF detected. Converting to images for batch processing.")
@@ -140,28 +156,18 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                     # OCR Step
                     if pytesseract:
                         try:
-                            # Debug Tesseract Path
-                            # print(f"DEBUG: Tesseract cmd: {pytesseract.pytesseract.tesseract_cmd}")
-                            
+                            # Run OCR in executor to avoid blocking
                             text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
                             batch_ocr_context += f"\n--- Page {page_num} Raw OCR Text ---\n{text}\n"
                         except Exception as e:
                             print(f"OCR Warning on page {page_num}: {e}")
-                            if "not installed" in str(e) or "not in your PATH" in str(e):
-                                 print("DEBUG: Attempting to set default Tesseract path for Docker...")
-                                 pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
-                                 try:
-                                     text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
-                                     batch_ocr_context += f"\n--- Page {page_num} Raw OCR Text ---\n{text}\n"
-                                     print("DEBUG: OCR succeeded with explicit path.")
-                                 except Exception as e2:
-                                     print(f"OCR Retry Failed: {e2}")
 
                     with io.BytesIO() as output:
                         image.save(output, format="JPEG", quality=95)
                         img_bytes = output.getvalue()
                         batch_content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
                     image.close()
+
 
                 # Call Gemini for this batch
                 print(f"DEBUG: Sending batch of {len(batch_content_parts)} page(s) to Gemini...")
