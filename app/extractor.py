@@ -151,8 +151,8 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             print(f"DEBUG: PDF converted. Total pages: {len(images)}")
 
             # Smart Batching: Process pages in chunks to avoid Output Token Limit (8192)
-            # Reduced Batch Size to 1 for ULTIMATE ACCURACY (Context Isolation)
-            BATCH_SIZE = 1
+            # Batch Size 2 is the "Sweet Spot" for Speed vs Accuracy vs Quota
+            BATCH_SIZE = 2
             
             all_pagewise_items = []
             total_item_count = 0
@@ -185,37 +185,22 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                         batch_content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
                     image.close()
 
-                # Create async task for this batch
-                print(f"DEBUG: Queueing Batch {i//BATCH_SIZE + 1} (Pages {i+1} to {min(i+BATCH_SIZE, len(images))})...")
+                # Call Gemini for this batch
+                print(f"DEBUG: Sending batch of {len(batch_content_parts)} page(s) to Gemini...")
+                batch_result = await call_gemini_api_async(batch_content_parts, batch_ocr_context)
                 
-                # Use a Semaphore to limit concurrency to 2 (Safe for Gemini Flash Quota)
-                # This prevents "429 Too Many Requests" which would actually SLOW us down due to retries.
-                sem = asyncio.Semaphore(2)
-                
-                async def sem_task(content, ocr):
-                    async with sem:
-                        return await call_gemini_api_async(content, ocr)
-
-                task = sem_task(batch_content_parts, batch_ocr_context)
-                batch_tasks.append(task)
-
-            # Execute all batches in parallel
-            print(f"DEBUG: Executing {len(batch_tasks)} batches in parallel...")
-            batch_results = await asyncio.gather(*batch_tasks)
-            
-            # Aggregate results
-            for batch_result in batch_results:
+                # Aggregate results
                 if batch_result:
                     if "pagewise_line_items" in batch_result:
                         all_pagewise_items.extend(batch_result["pagewise_line_items"])
                     if "total_item_count" in batch_result:
                         total_item_count += batch_result["total_item_count"]
+                
+                # Small delay to be nice to the API
+                await asyncio.sleep(1)
 
             # Explicit GC
             gc.collect()
-            
-            # Sort items by page number just in case they came back out of order (though extend preserves order of tasks)
-            # But page_no is a string, so we might want to rely on the list order which matches batch order.
             
             return {
                 "pagewise_line_items": all_pagewise_items,
