@@ -112,17 +112,33 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
 
     # Robust Tesseract Path Detection
     if pytesseract:
+        print(f"DEBUG: Current PATH: {os.environ.get('PATH')}")
         tesseract_path = shutil.which("tesseract")
+        
         if tesseract_path:
-            print(f"DEBUG: Tesseract found at: {tesseract_path}")
+            print(f"DEBUG: Tesseract found via shutil at: {tesseract_path}")
             pytesseract.pytesseract.tesseract_cmd = tesseract_path
         else:
-            # Try common Docker/Linux path if not found in PATH
-            if os.path.exists("/usr/bin/tesseract"):
-                 print("DEBUG: Tesseract found at /usr/bin/tesseract")
-                 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-            else:
-                 print("WARNING: Tesseract binary not found in PATH. OCR will be skipped.")
+            # Deep Debugging for Render
+            print("DEBUG: shutil.which('tesseract') returned None.")
+            common_paths = ["/usr/bin/tesseract", "/usr/local/bin/tesseract", "/bin/tesseract"]
+            found = False
+            for p in common_paths:
+                if os.path.exists(p):
+                    print(f"DEBUG: Found Tesseract manually at {p}")
+                    pytesseract.pytesseract.tesseract_cmd = p
+                    found = True
+                    break
+            
+            if not found:
+                 print("WARNING: Tesseract binary NOT found in common paths.")
+                 # List /usr/bin to see what's there (limited to t*)
+                 try:
+                     print("DEBUG: Listing /usr/bin/t* ...")
+                     import glob
+                     print(glob.glob("/usr/bin/t*"))
+                 except:
+                     pass
                  pytesseract = None
 
     if mime_type == 'application/pdf':
@@ -167,7 +183,6 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                         img_bytes = output.getvalue()
                         batch_content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
                     image.close()
-
 
                 # Call Gemini for this batch
                 print(f"DEBUG: Sending batch of {len(batch_content_parts)} page(s) to Gemini...")
