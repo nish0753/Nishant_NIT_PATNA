@@ -1,23 +1,80 @@
 import os
 import requests
 import json
-import google.generativeai as genai
-from dotenv import load_dotenv
-import re
-from PIL import Image, ImageEnhance
 import io
+import gc
+import shutil
+import glob
+import logging
 import asyncio
 import time
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import re
+
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+from PIL import Image, ImageEnhance
 from pdf2image import convert_from_bytes
 
+try:
+    import pytesseract as _pytesseract
+except ImportError:
+    _pytesseract = None
+
+try:
+    import json_repair
+except ImportError:
+    json_repair = None
+
 load_dotenv()
+
+# --- Logging ---
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "2"))
+PDF_DPI = int(os.getenv("PDF_DPI", "200"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "10"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Configure Gemini
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-if GENAI_API_KEY:
-    genai.configure(api_key=GENAI_API_KEY)
+# Create client once (reuse across calls)
+_client = None
+
+def _get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        if not GENAI_API_KEY:
+            raise RuntimeError("GOOGLE_API_KEY not found in environment variables.")
+        _client = genai.Client(api_key=GENAI_API_KEY)
+    return _client
+
+# --- Tesseract Setup ---
+def _setup_tesseract():
+    """Configure tesseract path once at startup."""
+    if _pytesseract is None:
+        logger.warning("pytesseract not installed. OCR step will be skipped.")
+        return None
+
+    tesseract_path = shutil.which("tesseract")
+    if tesseract_path:
+        logger.info("Tesseract found at: %s", tesseract_path)
+        _pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        return _pytesseract
+
+    common_paths = ["/usr/bin/tesseract", "/usr/local/bin/tesseract", "/bin/tesseract"]
+    for p in common_paths:
+        if os.path.exists(p):
+            logger.info("Tesseract found at: %s", p)
+            _pytesseract.pytesseract.tesseract_cmd = p
+            return _pytesseract
+
+    logger.warning("Tesseract binary NOT found. OCR step will be skipped.")
+    return None
+
+pytesseract = _setup_tesseract()
 
 def clean_json(text: str) -> str:
     # Remove markdown code blocks
@@ -49,47 +106,37 @@ def preprocess_image(image_bytes: bytes) -> bytes:
     """
     try:
         image = Image.open(io.BytesIO(image_bytes))
-        
-        # Convert to grayscale
         image = image.convert('L')
-        
-        # Enhance Contrast
         enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.5)  # Increase contrast by 50%
-        
-        # Enhance Sharpness
+        image = enhancer.enhance(1.5)
         enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(2.0)  # Increase sharpness
-        
-        # Save back to bytes
+        image = enhancer.enhance(2.0)
         output_buffer = io.BytesIO()
         image.save(output_buffer, format='JPEG', quality=95)
         return output_buffer.getvalue()
     except Exception as e:
-        print(f"Warning: Image preprocessing failed: {e}")
-        return image_bytes  # Return original if failed
+        logger.warning("Image preprocessing failed: %s", e)
+        return image_bytes
 
 def download_image(url: str) -> bytes:
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()
-        
         content_type = response.headers.get('Content-Type', '')
         if not content_type.startswith('image/') and content_type != 'application/pdf':
-            raise ValueError(f"Unsupported content type: {content_type}. Only images and PDFs are supported.")
-            
+            raise ValueError(f"Unsupported content type: {content_type}")
         return response.content, content_type
     except Exception as e:
-        print(f"Error downloading image: {e}")
+        logger.error("Error downloading image: %s", e)
         raise
 
 async def extract_bill_data(image_source, mime_type: str = None) -> dict:
     if not GENAI_API_KEY:
-        raise Exception("GOOGLE_API_KEY not found in environment variables.")
+        raise RuntimeError("GOOGLE_API_KEY not found in environment variables.")
 
     # 1. Get Raw Data
     if isinstance(image_source, str):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         file_data, mime_type = await loop.run_in_executor(None, download_image, image_source)
     else:
         file_data = image_source
@@ -97,70 +144,23 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             raise ValueError("Mime type must be provided for file uploads.")
 
     # 2. Magic Byte Detection (Fix for application/octet-stream)
-    # Azure/AWS sometimes return 'application/octet-stream' for PDFs.
-    # We sniff the first 4 bytes to see if it's actually a PDF.
     if file_data and len(file_data) > 4:
         if file_data[:4] == b'%PDF':
-            print(f"DEBUG: Detected PDF magic bytes. Overriding mime_type '{mime_type}' to 'application/pdf'")
+            logger.debug("Detected PDF magic bytes. Overriding mime_type '%s' to 'application/pdf'", mime_type)
             mime_type = 'application/pdf'
 
     # 3. Prepare Content Parts (List of images) and OCR Context
     content_parts = []
     ocr_context = ""
-    
-    import io
-    import gc
-    import shutil
-    from pdf2image import convert_from_bytes
-    try:
-        import pytesseract
-    except ImportError:
-        pytesseract = None
-        print("WARNING: pytesseract not found. OCR step will be skipped.")
-
-    # Robust Tesseract Path Detection
-    if pytesseract:
-        print(f"DEBUG: Current PATH: {os.environ.get('PATH')}")
-        tesseract_path = shutil.which("tesseract")
-        
-        if tesseract_path:
-            print(f"DEBUG: Tesseract found via shutil at: {tesseract_path}")
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
-        else:
-            # Deep Debugging for Render
-            print("DEBUG: shutil.which('tesseract') returned None.")
-            common_paths = ["/usr/bin/tesseract", "/usr/local/bin/tesseract", "/bin/tesseract"]
-            found = False
-            for p in common_paths:
-                if os.path.exists(p):
-                    print(f"DEBUG: Found Tesseract manually at {p}")
-                    pytesseract.pytesseract.tesseract_cmd = p
-                    found = True
-                    break
-            
-            if not found:
-                 print("WARNING: Tesseract binary NOT found in common paths.")
-                 # List /usr/bin to see what's there (limited to t*)
-                 try:
-                     print("DEBUG: Listing /usr/bin/t* ...")
-                     import glob
-                     print(glob.glob("/usr/bin/t*"))
-                 except:
-                     pass
-                 pytesseract = None
 
     if mime_type == 'application/pdf':
-        print("DEBUG: PDF detected. Converting to images for batch processing.")
+        logger.info("PDF detected. Converting to images for batch processing.")
         try:
-            loop = asyncio.get_event_loop()
-            # Convert all pages to images
-            # Reduced DPI to 200 to prevent OOM on Render (Free Tier 512MB RAM)
-            images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=200))
-            print(f"DEBUG: PDF converted. Total pages: {len(images)}")
+            loop = asyncio.get_running_loop()
+            images = await loop.run_in_executor(None, lambda: convert_from_bytes(file_data, dpi=PDF_DPI))
+            logger.info("PDF converted. Total pages: %d", len(images))
 
             # Smart Batching: Process pages in chunks to avoid Output Token Limit (8192)
-            # Batch Size 2 is the "Sweet Spot" for Speed vs Accuracy vs Quota
-            BATCH_SIZE = 2
             
             all_pagewise_items = []
             total_item_count = 0
@@ -177,24 +177,23 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                 for j, image in enumerate(batch_images):
                     page_num = i + j + 1
                     
-                    # OCR Step (Pre-compute OCR for all batches sequentially or parallel? 
-                    # Let's keep OCR inside the loop but run it efficiently)
                     if pytesseract:
                         try:
-                            # Run OCR in executor
                             text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
                             batch_ocr_context += f"\n--- Page {page_num} Raw OCR Text ---\n{text}\n"
                         except Exception as e:
-                            print(f"OCR Warning on page {page_num}: {e}")
+                            logger.warning("OCR Warning on page %d: %s", page_num, e)
 
                     with io.BytesIO() as output:
                         image.save(output, format="JPEG", quality=95)
                         img_bytes = output.getvalue()
-                        batch_content_parts.append({'mime_type': 'image/jpeg', 'data': img_bytes})
+                        batch_content_parts.append(
+                            types.Part.from_bytes(data=img_bytes, mime_type='image/jpeg')
+                        )
                     image.close()
 
                 # Call Gemini for this batch
-                print(f"DEBUG: Sending batch of {len(batch_content_parts)} page(s) to Gemini...")
+                logger.info("Sending batch of %d page(s) to Gemini...", len(batch_content_parts))
                 batch_result = await call_gemini_api_async(batch_content_parts, batch_ocr_context)
                 
                 # Aggregate results
@@ -216,12 +215,12 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
             }
 
         except Exception as e:
-            print(f"ERROR: PDF Processing Failed: {e}")
+            logger.error("PDF Processing Failed: %s", e)
             raise
     
     elif mime_type.startswith('image/'):
-        print("Applying image preprocessing...")
-        loop = asyncio.get_event_loop()
+        logger.info("Applying image preprocessing...")
+        loop = asyncio.get_running_loop()
         processed_data = await loop.run_in_executor(None, preprocess_image, file_data)
         
         # OCR for single image
@@ -232,23 +231,27 @@ async def extract_bill_data(image_source, mime_type: str = None) -> dict:
                 text = await loop.run_in_executor(None, pytesseract.image_to_string, img_obj)
                 ocr_context += f"\n--- Raw OCR Text ---\n{text}\n"
             except Exception as e:
-                print(f"OCR Warning: {e}")
+                logger.warning("OCR Warning: %s", e)
 
-        content_parts.append({'mime_type': 'image/jpeg', 'data': processed_data})
+        content_parts.append(
+            types.Part.from_bytes(data=processed_data, mime_type='image/jpeg')
+        )
         
         # Single image call
         return await call_gemini_api_async(content_parts, ocr_context)
     
     else:
         # Fallback
-        content_parts.append({'mime_type': mime_type, 'data': file_data})
+        content_parts.append(
+            types.Part.from_bytes(data=file_data, mime_type=mime_type)
+        )
         return await call_gemini_api_async(content_parts, ocr_context)
 
 
 async def call_gemini_api_async(content_parts, ocr_context=""):
-    """Helper function to call Gemini with a list of content parts and optional OCR context."""
-    # Updated to gemini-2.0-flash (Stable)
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    """Call Gemini with a list of content parts and optional OCR context.
+    Returns result_dict with extracted data."""
+    client = _get_client()
     
     base_prompt = """
     You are an expert data extraction agent. Your task is to extract line item details from the provided bill/invoice images.
@@ -284,10 +287,10 @@ async def call_gemini_api_async(content_parts, ocr_context=""):
     else:
         prompt = base_prompt
 
-    generation_config = genai.GenerationConfig(
+    generation_config = types.GenerateContentConfig(
         max_output_tokens=8192,
         response_mime_type="application/json",
-        response_schema={
+        response_json_schema={
             "type": "object",
             "properties": {
                 "pagewise_line_items": {
@@ -317,31 +320,30 @@ async def call_gemini_api_async(content_parts, ocr_context=""):
                 "total_item_count": {"type": "integer"}
             },
             "required": ["pagewise_line_items", "total_item_count"]
-        }
+        },
+        safety_settings=[
+            types.SafetySetting(category='HARM_CATEGORY_HARASSMENT', threshold='OFF'),
+            types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='OFF'),
+            types.SafetySetting(category='HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold='OFF'),
+            types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='OFF'),
+        ],
     )
 
-    safety_settings = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-    }
-
-    max_retries = 10
+    max_retries = MAX_RETRIES
     for attempt in range(max_retries):
         try:
             # Construct the full prompt content: [img1, img2, ..., text_prompt]
             full_content = content_parts + [prompt]
             
-            response = await model.generate_content_async(
-                full_content,
-                generation_config=generation_config,
-                safety_settings=safety_settings
+            response = await client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=full_content,
+                config=generation_config,
             )
             
             try:
                 text = response.text.strip()
-            except Exception as e:
+            except Exception:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
                     continue
@@ -363,24 +365,24 @@ async def call_gemini_api_async(content_parts, ocr_context=""):
                 return data_dict
 
             except json.JSONDecodeError as e:
-                print(f"JSON Parse Error: {e}")
+                logger.warning("JSON Parse Error: %s", e)
                 # Try robust repair
-                try:
-                    import json_repair
-                    print("DEBUG: Attempting to repair JSON with json_repair...")
-                    data_dict = json_repair.loads(text)
+                if json_repair:
+                    try:
+                        logger.debug("Attempting to repair JSON with json_repair...")
+                        data_dict = json_repair.loads(text)
                     
-                    # Validate structure after repair
-                    if isinstance(data_dict, dict) and "pagewise_line_items" in data_dict:
-                        total_count = 0
-                        for page in data_dict.get("pagewise_line_items", []):
-                            for item in page.get("bill_items", []):
-                                total_count += 1
-                        data_dict['total_item_count'] = total_count
-                        print("DEBUG: JSON repair successful.")
-                        return data_dict
-                except Exception as repair_e:
-                    print(f"JSON Repair Failed: {repair_e}")
+                        # Validate structure after repair
+                        if isinstance(data_dict, dict) and "pagewise_line_items" in data_dict:
+                            total_count = 0
+                            for page in data_dict.get("pagewise_line_items", []):
+                                for item in page.get("bill_items", []):
+                                    total_count += 1
+                            data_dict['total_item_count'] = total_count
+                            logger.info("JSON repair successful.")
+                            return data_dict
+                    except Exception as repair_e:
+                        logger.warning("JSON Repair Failed: %s", repair_e)
 
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2)
@@ -391,13 +393,13 @@ async def call_gemini_api_async(content_parts, ocr_context=""):
             error_str = str(e)
             if "429" in error_str or "Quota exceeded" in error_str or "ResourceExhausted" in error_str:
                 if attempt < max_retries - 1:
-                    wait_time = 5 * (2 ** attempt)
-                    print(f"Quota exceeded (Attempt {attempt+1}/{max_retries}). Retrying in {wait_time} seconds...")
+                    wait_time = min(5 * (2 ** attempt), 60)  # Cap at 60s
+                    logger.warning("Quota exceeded (Attempt %d/%d). Retrying in %ds...", attempt + 1, max_retries, wait_time)
                     await asyncio.sleep(wait_time)
                     continue
             
-            print(f"Gemini API Error: {e}")
+            logger.error("Gemini API Error: %s", e)
             if attempt < max_retries - 1:
                  await asyncio.sleep(2)
                  continue
-            raise ValueError(f"Gemini API failed: {e}")
+            raise ValueError(f"Gemini API failed after {max_retries} attempts: {e}")
